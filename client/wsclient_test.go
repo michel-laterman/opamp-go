@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/lxzan/gws"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -41,7 +41,7 @@ func TestWSSenderReportsHeartbeat(t *testing.T) {
 
 		var firstMsg atomic.Bool
 		var conn atomic.Value
-		srv.OnWSConnect = func(c *websocket.Conn) {
+		srv.OnWSConnect = func(c *gws.Conn) {
 			conn.Store(c)
 			firstMsg.Store(true)
 		}
@@ -110,7 +110,7 @@ func TestWSClientStartWithHeartbeatInterval(t *testing.T) {
 			srv := internal.StartMockServer(t)
 
 			var conn atomic.Value
-			srv.OnWSConnect = func(c *websocket.Conn) {
+			srv.OnWSConnect = func(c *gws.Conn) {
 				conn.Store(c)
 			}
 			var msgCount atomic.Int64
@@ -156,7 +156,7 @@ func TestDisconnectWSByServer(t *testing.T) {
 	srv := internal.StartMockServer(t)
 
 	var conn atomic.Value
-	srv.OnWSConnect = func(c *websocket.Conn) {
+	srv.OnWSConnect = func(c *gws.Conn) {
 		conn.Store(c)
 	}
 
@@ -183,7 +183,7 @@ func TestDisconnectWSByServer(t *testing.T) {
 
 	// Close the Server and forcefully disconnect.
 	srv.Close()
-	_ = conn.Load().(*websocket.Conn).Close()
+	_ = conn.Load().(*gws.Conn).NetConn().Close()
 
 	// The client must retry and must fail now.
 	eventually(t, func() bool { return connectErr.Load() != nil })
@@ -400,7 +400,7 @@ func TestRedirectWS(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.Name, func(t *testing.T) {
 			var conn atomic.Value
-			redirectee.OnWSConnect = func(c *websocket.Conn) {
+			redirectee.OnWSConnect = func(c *gws.Conn) {
 				conn.Store(c)
 			}
 
@@ -413,7 +413,7 @@ func TestRedirectWS(t *testing.T) {
 						atomic.StoreInt64(&connected, 1)
 					},
 					OnConnectFailed: func(ctx context.Context, err error) {
-						if err != websocket.ErrBadHandshake {
+						if err != gws.ErrHandshake {
 							connectErr.Store(err)
 						}
 					},
@@ -464,7 +464,7 @@ func TestRedirectWSFollowChain(t *testing.T) {
 	redirector := redirectServer("http://"+middleURL.Host, 302)
 
 	var conn atomic.Value
-	redirectee.OnWSConnect = func(c *websocket.Conn) {
+	redirectee.OnWSConnect = func(c *gws.Conn) {
 		conn.Store(c)
 	}
 
@@ -478,7 +478,7 @@ func TestRedirectWSFollowChain(t *testing.T) {
 				atomic.StoreInt64(&connected, 1)
 			},
 			OnConnectFailed: func(ctx context.Context, err error) {
-				if err != websocket.ErrBadHandshake {
+				if err != gws.ErrHandshake {
 					connectErr.Store(err)
 				}
 			},
@@ -514,14 +514,21 @@ func TestHandlesStopBeforeStart(t *testing.T) {
 
 func TestPerformsClosingHandshake(t *testing.T) {
 	srv := internal.StartMockServer(t)
-	var wsConn *websocket.Conn
+	//var serverConn *gws.Conn
 	connected := make(chan struct{})
 	closed := make(chan struct{})
 	acked := make(chan struct{})
 
-	srv.OnWSConnect = func(conn *websocket.Conn) {
-		wsConn = conn
+	srv.OnWSConnect = func(conn *gws.Conn) {
+		//serverConn = conn
 		connected <- struct{}{}
+	}
+	srv.OnClose = func(conn *gws.Conn, err error) {
+		close(acked)
+		var ce *gws.CloseError
+		require.ErrorAs(t, err, &ce)
+		require.Equal(t, uint16(1000), ce.Code, "Client sent non-normal closing code")
+		closed <- struct{}{}
 	}
 
 	client := NewWebSocket(nil)
@@ -542,24 +549,6 @@ func TestPerformsClosingHandshake(t *testing.T) {
 		return conn != nil
 	})
 
-	{
-		defhandler := client.conn.CloseHandler()
-		client.conn.SetCloseHandler(func(code int, msg string) error {
-			close(acked)
-			return defhandler(code, msg)
-		})
-	}
-
-	defHandler := wsConn.CloseHandler()
-
-	wsConn.SetCloseHandler(func(code int, _ string) error {
-		require.Equal(t, websocket.CloseNormalClosure, code, "Client sent non-normal closing code")
-
-		err := defHandler(code, "")
-		closed <- struct{}{}
-		return err
-	})
-
 	client.Stop(context.Background())
 
 	select {
@@ -576,13 +565,20 @@ func TestPerformsClosingHandshake(t *testing.T) {
 
 func TestHandlesSlowCloseMessageFromServer(t *testing.T) {
 	srv := internal.StartMockServer(t)
-	var wsConn *websocket.Conn
+	//var serverConn *gws.Conn
 	connected := make(chan struct{})
 	closed := make(chan struct{})
 
-	srv.OnWSConnect = func(conn *websocket.Conn) {
-		wsConn = conn
+	srv.OnWSConnect = func(conn *gws.Conn) {
+		//serverConn = conn
 		connected <- struct{}{}
+	}
+	srv.OnClose = func(conn *gws.Conn, err error) {
+		var ce *gws.CloseError
+		require.ErrorAs(t, err, &ce)
+		require.Equal(t, uint16(1000), ce.Code, "Client sent non-normal closing code")
+		time.Sleep(200 * time.Millisecond)
+		closed <- struct{}{}
 	}
 
 	client := NewWebSocket(nil)
@@ -603,17 +599,6 @@ func TestHandlesSlowCloseMessageFromServer(t *testing.T) {
 		client.connMutex.RUnlock()
 		return conn != nil
 	}, 2*time.Second, 250*time.Millisecond)
-
-	defHandler := wsConn.CloseHandler()
-
-	wsConn.SetCloseHandler(func(code int, _ string) error {
-		require.Equal(t, websocket.CloseNormalClosure, code, "Client sent non-normal closing code")
-
-		time.Sleep(200 * time.Millisecond)
-		err := defHandler(code, "")
-		closed <- struct{}{}
-		return err
-	})
 
 	client.Stop(context.Background())
 
@@ -626,12 +611,12 @@ func TestHandlesSlowCloseMessageFromServer(t *testing.T) {
 
 func TestHandlesNoCloseMessageFromServer(t *testing.T) {
 	srv := internal.StartMockServer(t)
-	var wsConn *websocket.Conn
+	//var serverConn *gws.Conn
 	connected := make(chan struct{})
 	closed := make(chan struct{})
 
-	srv.OnWSConnect = func(conn *websocket.Conn) {
-		wsConn = conn
+	srv.OnWSConnect = func(conn *gws.Conn) {
+		//serverConn = conn
 		connected <- struct{}{}
 	}
 
@@ -653,11 +638,6 @@ func TestHandlesNoCloseMessageFromServer(t *testing.T) {
 		client.connMutex.RUnlock()
 		return conn != nil
 	}, 2*time.Second, 250*time.Millisecond)
-
-	wsConn.SetCloseHandler(func(code int, _ string) error {
-		// Don't send close message
-		return nil
-	})
 
 	go func() {
 		client.Stop(context.Background())
@@ -673,10 +653,10 @@ func TestHandlesNoCloseMessageFromServer(t *testing.T) {
 
 func TestHandlesConnectionError(t *testing.T) {
 	srv := internal.StartMockServer(t)
-	var wsConn *websocket.Conn
+	var wsConn *gws.Conn
 	connected := make(chan struct{})
 
-	srv.OnWSConnect = func(conn *websocket.Conn) {
+	srv.OnWSConnect = func(conn *gws.Conn) {
 		wsConn = conn
 		connected <- struct{}{}
 	}
@@ -701,12 +681,7 @@ func TestHandlesConnectionError(t *testing.T) {
 
 	// Write an invalid message to the connection. The client
 	// will take this as an error and reconnect to the server.
-	writer, err := wsConn.NextWriter(websocket.BinaryMessage)
-	require.NoError(t, err)
-	n, err := writer.Write([]byte{99, 1, 2, 3, 4, 5})
-	require.NoError(t, err)
-	require.Equal(t, 6, n)
-	err = writer.Close()
+	err := wsConn.WriteMessage(gws.OpcodeBinary, []byte{99, 1, 2, 3, 4, 5})
 	require.NoError(t, err)
 
 	select {
@@ -747,7 +722,7 @@ func TestWSSenderReportsAvailableComponents(t *testing.T) {
 
 			var firstMsg atomic.Bool
 			var conn atomic.Value
-			srv.OnWSConnect = func(c *websocket.Conn) {
+			srv.OnWSConnect = func(c *gws.Conn) {
 				conn.Store(c)
 				firstMsg.Store(true)
 			}
@@ -815,6 +790,43 @@ func TestWSSenderReportsAvailableComponents(t *testing.T) {
 			// Stop the client.
 			err := client.Stop(context.Background())
 			assert.NoError(t, err)
+		})
+	}
+}
+
+func TestWSClientUseProxy(t *testing.T) {
+	tests := []struct {
+		name     string
+		settings types.StartSettings
+		err      error
+	}{{
+		name:     "http proxy",
+		settings: types.StartSettings{ProxyURL: "http://proxy.internal:8080"},
+		err:      nil,
+	}, {
+		name:     "socks5 proxy",
+		settings: types.StartSettings{ProxyURL: "socks5://proxy.internal:8080"},
+		err:      nil,
+	}, {
+		name:     "no schema",
+		settings: types.StartSettings{ProxyURL: "proxy.internal:8080"},
+		err:      nil,
+	}, {
+		name:     "empty url",
+		settings: types.StartSettings{ProxyURL: ""},
+		err:      url.InvalidHostError(""),
+	}}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &wsClient{
+				gwsOptions: &gws.ClientOption{},
+			}
+			err := client.useProxy(tc.settings)
+			if tc.err != nil {
+				assert.ErrorAs(t, err, &tc.err)
+			} else {
+				assert.NoError(t, err)
+			}
 		})
 	}
 }

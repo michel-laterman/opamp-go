@@ -14,11 +14,6 @@ import (
 	"github.com/open-telemetry/opamp-go/protobufs"
 )
 
-const (
-	defaultSendCloseMessageTimeout = 5 * time.Second
-	defaultHeartbeatIntervalMs     = 30 * 1000
-)
-
 // WSSender implements the WebSocket client's sending portion of OpAMP protocol.
 type WSSender struct {
 	SenderCommon

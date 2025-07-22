@@ -3,14 +3,18 @@ package client
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
-	"github.com/gorilla/websocket"
+	"github.com/lxzan/gws"
+	"golang.org/x/net/proxy"
 
 	"github.com/open-telemetry/opamp-go/client/internal"
 	"github.com/open-telemetry/opamp-go/client/types"
@@ -21,8 +25,6 @@ import (
 const (
 	defaultShutdownTimeout = 5 * time.Second
 )
-
-var _ OpAMPClient = (*wsClient)(nil)
 
 // wsClient is an OpAMP Client implementation for WebSocket transport.
 // See specification: https://github.com/open-telemetry/opamp-spec/blob/main/specification.md#websocket-transport
@@ -35,13 +37,17 @@ type wsClient struct {
 	// HTTP request headers to use when connecting to OpAMP Server.
 	getHeader func() http.Header
 
-	// Websocket dialer and connection.
-	dialer    websocket.Dialer
-	conn      *websocket.Conn
+	// gwsOptions specifies connection options
+	gwsOptions *gws.ClientOption
+
+	conn      *gws.Conn
 	connMutex sync.RWMutex
 
+	// websocket implements gws.Event and proves a messages channel for the receiver
+	websocket *internal.Websocket
+
 	// The sender is responsible for sending portion of the OpAMP protocol.
-	sender *internal.WSSender
+	sender *internal.WebsocketSender
 
 	// last non-nil internal error that was encountered in the conn retry loop,
 	// currently used only for testing.
@@ -64,10 +70,11 @@ func NewWebSocket(logger types.Logger) *wsClient {
 		logger = &sharedinternal.NopLogger{}
 	}
 
-	sender := internal.NewSender(logger)
+	sender := internal.NewWebsocketSender(logger)
 	w := &wsClient{
 		common:              internal.NewClientCommon(logger, sender),
 		sender:              sender,
+		websocket:           internal.NewWebsocket(logger),
 		connShutdownTimeout: defaultShutdownTimeout,
 	}
 	return w
@@ -79,7 +86,18 @@ func (c *wsClient) Start(ctx context.Context, settings types.StartSettings) erro
 	}
 
 	// Prepare connection settings.
-	c.dialer = *websocket.DefaultDialer
+	c.gwsOptions = &gws.ClientOption{
+		PermessageDeflate: gws.PermessageDeflate{
+			Enabled: settings.EnableCompression,
+			// TODO do we need to set defaults for the other settings?
+		},
+		Addr:             settings.OpAMPServerURL,
+		HandshakeTimeout: 45 * time.Second,
+		TlsConfig:        settings.TLSConfig,
+	}
+	if err := c.useProxy(settings); err != nil {
+		return err
+	}
 
 	var err error
 	c.url, err = url.Parse(settings.OpAMPServerURL)
@@ -87,12 +105,9 @@ func (c *wsClient) Start(ctx context.Context, settings types.StartSettings) erro
 		return err
 	}
 
-	c.dialer.EnableCompression = settings.EnableCompression
-
 	if settings.TLSConfig != nil {
 		c.url.Scheme = "wss"
 	}
-	c.dialer.TLSClientConfig = settings.TLSConfig
 
 	headerFunc := settings.HeaderFunc
 	if headerFunc == nil {
@@ -162,11 +177,6 @@ func (c *wsClient) SendCustomMessage(message *protobufs.CustomMessage) (messageS
 // SetAvailableComponents implements OpAMPClient.SetAvailableComponents
 func (c *wsClient) SetAvailableComponents(components *protobufs.AvailableComponents) error {
 	return c.common.SetAvailableComponents(components)
-}
-
-// SetCapabilities implements OpAMPClient.
-func (c *wsClient) SetCapabilities(capabilities *protobufs.AgentCapabilities) error {
-	return c.common.SetCapabilities(capabilities)
 }
 
 func viaReq(resps []*http.Response) []*http.Request {
@@ -240,7 +250,7 @@ func (c *wsClient) tryConnectOnce(ctx context.Context) (retryAfter sharedinterna
 			}
 		}
 	}()
-	conn, resp, err := c.dialer.DialContext(ctx, c.url.String(), c.getHeader())
+	conn, resp, err := gws.NewClient(c.websocket, c.gwsOptions)
 	if err != nil {
 		if !c.common.IsStopping() {
 			c.common.Callbacks.OnConnectFailed(ctx, err)
@@ -265,6 +275,9 @@ func (c *wsClient) tryConnectOnce(ctx context.Context) (retryAfter sharedinterna
 	c.conn = conn
 	c.connMutex.Unlock()
 	c.common.Callbacks.OnConnect(ctx)
+	// ReadLoop terminates cleanly if conn.WriteClose is used, or abruptly if the underlying network conn is closed
+	// FIXME: Termination order should be reciver, -> loop+sender? there is currently a bug where the reciever will try to process a nil message
+	go c.conn.ReadLoop()
 
 	return sharedinternal.OptionalDuration{Defined: false}, nil
 }
@@ -335,8 +348,8 @@ func (c *wsClient) runOneCycle(ctx context.Context) {
 		// are being stopped.
 		return
 	}
-	// Close the underlying connection.
-	defer c.conn.Close()
+
+	defer c.conn.NetConn().Close() // terminate underlying connection without ws control frames
 
 	if c.common.IsStopping() {
 		return
@@ -362,13 +375,14 @@ func (c *wsClient) runOneCycle(ctx context.Context) {
 	}
 
 	// First status report sent. Now loop to receive and process messages.
-	r := internal.NewWSReceiver(
+	r := internal.NewWebsocketReceiver(
 		c.common.Logger,
 		c.common.Callbacks,
-		c.conn,
+		c.websocket,
 		c.sender,
 		&c.common.ClientSyncedState,
 		c.common.PackagesStateProvider,
+		c.common.Capabilities,
 		&c.common.PackageSyncMutex,
 		c.common.DownloadReporterInterval,
 	)
@@ -383,9 +397,12 @@ func (c *wsClient) runOneCycle(ctx context.Context) {
 	select {
 	case <-c.sender.IsStopped():
 		// sender will send close message to initiate the close handshake
-		if err := c.sender.StoppingErr(); err != nil {
+		hadErrors := false
+		for err := range c.sender.Errors() {
 			c.common.Logger.Debugf(ctx, "Error stopping the sender: %v", err)
-
+			hadErrors = true
+		}
+		if hadErrors {
 			stopReceiver()
 			<-r.IsStopped()
 			break
@@ -418,4 +435,55 @@ func (c *wsClient) runUntilStopped(ctx context.Context) {
 
 		c.runOneCycle(ctx)
 	}
+}
+
+// useProxy sets the websocket dialer to use the passed proxy URL.
+// If settings has no ProxyURL, no custom dialer is used.
+// If the ProxyURL has no schema http is assumed.
+// This method is not thread safe and must be called before c.dialer is used.
+func (c *wsClient) useProxy(settings types.StartSettings) error {
+	if settings.ProxyURL == "" {
+		c.gwsOptions.NewDialer = nil // NOTE: Should we default to proxy.FromEnvironment instead?
+		return nil
+	}
+	proxyURL, err := url.Parse(settings.ProxyURL)
+	if err != nil || proxyURL.Scheme == "" || proxyURL.Host == "" { // error or bad URL - try to use http as scheme to resolve
+		proxyURL, err = url.Parse("http://" + settings.ProxyURL)
+		if err != nil {
+			return err
+		}
+	}
+	if proxyURL.Hostname() == "" {
+		return url.InvalidHostError(settings.ProxyURL)
+	}
+	var dialerFn func() (gws.Dialer, error)
+	switch strings.ToLower(proxyURL.Scheme) {
+	case "http", "https":
+		dialerFn = func() (gws.Dialer, error) { return proxy.FromURL(proxyURL, &net.Dialer{}) }
+		// TODO use custom dialer once it's in upstream lib, or move to client/internal?
+		//dialerFn = func() (gws.Dialer, error) {gws.NewProxyConnectDialerWithOptions(proxyURL, &net.Dialer{}, gws.ProxyConnectDialerOptions{
+		//	TLS:          settings.TLSConfig,
+		//	ProxyConnect: settings.ProxyHeaders,
+		//})}
+	case "socks5":
+		var auth *proxy.Auth
+		user := proxyURL.User.Username()
+		pass, ok := proxyURL.User.Password()
+		if ok && pass != "" && user != "" {
+			auth = &proxy.Auth{
+				User:     user,
+				Password: pass,
+			}
+		}
+		dialerFn = func() (gws.Dialer, error) { return proxy.SOCKS5("tcp", proxyURL.Hostname(), auth, &net.Dialer{}) } // NOTE we currently only support tcp SOCKS5 proxies
+	default:
+		dialerFn = func() (gws.Dialer, error) { return proxy.FromURL(proxyURL, &net.Dialer{}) }
+	}
+
+	if dialerFn == nil {
+		return fmt.Errorf("unable to find proxy dialer for %s scheme", proxyURL.Scheme)
+	}
+
+	c.gwsOptions.NewDialer = dialerFn
+	return nil
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/gorilla/websocket"
+	"github.com/lxzan/gws"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -67,4 +68,23 @@ func WriteWSMessage(conn *websocket.Conn, msg proto.Message) error {
 	}
 
 	return writer.Close()
+}
+
+func WriteGWSMessage(conn *gws.Conn, msg proto.Message) error {
+	data, err := proto.Marshal(msg)
+	if err != nil {
+		return err
+	}
+
+	// Encode header as a varint.
+	hdrBuf := make([]byte, binary.MaxVarintLen64)
+	n := binary.PutUvarint(hdrBuf, wsMsgHeader)
+	hdrBuf = hdrBuf[:n]
+
+	// Write the messages.
+	err = conn.Writev(gws.OpcodeBinary, hdrBuf, data)
+	if err != nil {
+		return err
+	}
+	return nil
 }

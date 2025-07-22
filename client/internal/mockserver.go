@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/lxzan/gws"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/protobuf/proto"
 
@@ -19,14 +19,66 @@ import (
 
 type receivedMessageHandler func(msg *protobufs.AgentToServer) *protobufs.ServerToAgent
 
+type gwsEvent struct {
+	gws.BuiltinEventHandler
+	mockServer *MockServer
+}
+
+// OnOpen call's the mockServer's OnWSConnect function if defined.
+func (g *gwsEvent) OnOpen(conn *gws.Conn) {
+	if g.mockServer.OnWSConnect != nil {
+		g.mockServer.OnWSConnect(conn)
+	}
+}
+
+// OnClose call's the mockServer's OnClose function if defined.
+func (g *gwsEvent) OnClose(conn *gws.Conn, err error) {
+	if g.mockServer.OnClose != nil {
+		g.mockServer.OnClose(conn, err)
+	}
+}
+
+// OnMessage parses handles any messages that the server recieves.
+func (g *gwsEvent) OnMessage(conn *gws.Conn, message *gws.Message) {
+	defer message.Close()
+	assert.Equal(g.mockServer.t, gws.OpcodeBinary, message.Opcode)
+	msgBytes := message.Bytes()
+	if len(msgBytes) > 0 && msgBytes[0] == 0 {
+		// New message format. The Protobuf message is preceded by a zero byte header.
+		// Skip the zero byte.
+		msgBytes = msgBytes[1:]
+	}
+
+	// We use alwaysRespond=false here because WebSocket requests must only have
+	// a response when a response is provided by the user-defined handler.
+	// handleReceivedBytes will call the user defined handler: mockServer.OnMessage
+	msgBytes = g.mockServer.handleReceivedBytes(msgBytes, false)
+	if msgBytes != nil {
+		// Prepend zero-byte header.
+		msgBytes = append([]byte{0}, msgBytes...)
+
+		err := conn.WriteMessage(gws.OpcodeBinary, msgBytes)
+		if err != nil {
+			g.mockServer.t.Fatal("cannot send:", err)
+		}
+	}
+}
+
 type MockServer struct {
-	t           *testing.T
-	Endpoint    string
-	OnRequest   func(w http.ResponseWriter, r *http.Request)
-	OnConnect   func(r *http.Request)
-	OnWSConnect func(conn *websocket.Conn)
+	t        *testing.T
+	Endpoint string
+
+	// For http
+	OnRequest func(w http.ResponseWriter, r *http.Request)
+	OnConnect func(r *http.Request)
+
+	// For websockets
+	OnWSConnect func(conn *gws.Conn)
+	OnClose     func(conn *gws.Conn, err error)
 	OnMessage   func(msg *protobufs.AgentToServer) *protobufs.ServerToAgent
-	srv         *httptest.Server
+	gwsEvent    *gwsEvent
+
+	srv *httptest.Server
 
 	expectedHandlers  chan receivedMessageHandler
 	expectedComplete  chan struct{}
@@ -45,6 +97,7 @@ func newMockServer(t *testing.T) (*MockServer, *http.ServeMux) {
 		expectedHandlers: make(chan receivedMessageHandler),
 		expectedComplete: make(chan struct{}),
 	}
+	srv.gwsEvent = &gwsEvent{mockServer: srv}
 
 	m := http.NewServeMux()
 	m.HandleFunc(
@@ -138,44 +191,17 @@ func (m *MockServer) EnableCompression() {
 }
 
 func (m *MockServer) handleWebSocket(t *testing.T, w http.ResponseWriter, r *http.Request) {
-	upgrader := websocket.Upgrader{
-		EnableCompression: m.enableCompression,
-	}
+	upgrader := gws.NewUpgrader(m.gwsEvent, &gws.ServerOption{
+		PermessageDeflate: gws.PermessageDeflate{
+			Enabled: m.enableCompression,
+		},
+	})
 
-	conn, err := upgrader.Upgrade(w, r, nil)
+	conn, err := upgrader.Upgrade(w, r)
 	if err != nil {
 		return
 	}
-	if m.OnWSConnect != nil {
-		m.OnWSConnect(conn)
-	}
-	for {
-		var messageType int
-		var msgBytes []byte
-		if messageType, msgBytes, err = conn.ReadMessage(); err != nil {
-			return
-		}
-		assert.EqualValues(t, websocket.BinaryMessage, messageType)
-
-		if len(msgBytes) > 0 && msgBytes[0] == 0 {
-			// New message format. The Protobuf message is preceded by a zero byte header.
-			// Skip the zero byte.
-			msgBytes = msgBytes[1:]
-		}
-
-		// We use alwaysRespond=false here because WebSocket requests must only have
-		// a response when a response is provided by the user-defined handler.
-		msgBytes = m.handleReceivedBytes(msgBytes, false)
-		if msgBytes != nil {
-			// Prepend zero-byte header.
-			msgBytes = append([]byte{0}, msgBytes...)
-
-			err = conn.WriteMessage(websocket.BinaryMessage, msgBytes)
-			if err != nil {
-				log.Fatal("cannot send:", err)
-			}
-		}
-	}
+	conn.ReadLoop()
 }
 
 func (m *MockServer) handleReceivedBytes(msgBytes []byte, alwaysRespond bool) []byte {
@@ -288,5 +314,6 @@ func (m *MockServer) EventuallyExpect(
 
 func (m *MockServer) Close() {
 	close(m.expectedHandlers)
+	// TODO terminate WS cleanly
 	m.srv.Close()
 }

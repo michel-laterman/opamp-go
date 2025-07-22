@@ -596,7 +596,7 @@ func TestIncludesDetailsOnReconnect(t *testing.T) {
 
 	// close the Agent connection. expect it to reconnect and send details again.
 	require.NotNil(t, client.conn)
-	err := client.conn.Close()
+	err := client.conn.NetConn().Close() // close connection with no control frame
 	assert.NoError(t, err)
 
 	eventually(t, func() bool { return atomic.LoadInt64(&connected) == 2 })
