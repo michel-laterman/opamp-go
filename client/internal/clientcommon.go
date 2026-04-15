@@ -63,6 +63,10 @@ type ClientCommon struct {
 	// DownloadReporterInterval is the interval used to update a package's status while it is downloading.
 	// It is set to 10s by default, a min value of 1s is forced.
 	DownloadReporterInterval time.Duration
+
+	// MaxRetryAfter caps server-specified retry durations for UNAVAILABLE responses.
+	// Zero means no cap.
+	MaxRetryAfter time.Duration
 }
 
 // NewClientCommon creates a new ClientCommon.
@@ -185,6 +189,8 @@ func (c *ClientCommon) PrepareStart(
 	} else if settings.DownloadReporterInterval != nil {
 		c.DownloadReporterInterval = *settings.DownloadReporterInterval
 	}
+
+	c.MaxRetryAfter = settings.MaxRetryAfter
 
 	if c.hasCapability(protobufs.AgentCapabilities_AgentCapabilities_ReportsConnectionSettingsStatus) && settings.LastConnectionSettingsStatus != nil {
 		c.ClientSyncedState.SetConnectionSettingsStatus(settings.LastConnectionSettingsStatus)

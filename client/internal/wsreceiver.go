@@ -22,6 +22,13 @@ type wsReceiver struct {
 
 	// Indicates that the receiver has fully stopped.
 	stopped chan struct{}
+
+	// throttled is true when the receiver stopped due to an UNAVAILABLE response.
+	throttled bool
+
+	// retryAfter is set when the server sends an UNAVAILABLE response with retry info.
+	// Zero means the server did not specify a duration and the caller should use backoff.
+	retryAfter time.Duration
 }
 
 // NewWSReceiver creates a new Receiver that uses WebSocket to receive
@@ -35,13 +42,14 @@ func NewWSReceiver(
 	packagesStateProvider types.PackagesStateProvider,
 	packageSyncMutex *sync.Mutex,
 	reporterInterval time.Duration,
+	maxRetryAfter time.Duration,
 ) *wsReceiver {
 	w := &wsReceiver{
 		conn:      conn,
 		logger:    logger,
 		sender:    sender,
 		callbacks: callbacks,
-		processor: newReceivedProcessor(logger, callbacks, sender, clientSyncedState, packagesStateProvider, packageSyncMutex, reporterInterval),
+		processor: newReceivedProcessor(logger, callbacks, sender, clientSyncedState, packagesStateProvider, packageSyncMutex, reporterInterval, maxRetryAfter),
 		stopped:   make(chan struct{}),
 	}
 
@@ -56,6 +64,19 @@ func (r *wsReceiver) Start(ctx context.Context) {
 // IsStopped returns a channel that's closed when the receiver is stopped.
 func (r *wsReceiver) IsStopped() <-chan struct{} {
 	return r.stopped
+}
+
+// Throttled returns true if the receiver stopped because the server sent an
+// UNAVAILABLE error response.
+func (r *wsReceiver) Throttled() bool {
+	return r.throttled
+}
+
+// RetryAfter returns the duration the client should wait before reconnecting.
+// Only meaningful when Throttled() returns true. Zero means the server did not
+// specify a duration and the caller should use exponential backoff.
+func (r *wsReceiver) RetryAfter() time.Duration {
+	return r.retryAfter
 }
 
 // ReceiverLoop runs the receiver loop.
@@ -92,7 +113,11 @@ func (r *wsReceiver) ReceiverLoop(ctx context.Context) {
 					}
 					return
 				}
-				r.processor.ProcessReceivedMessage(ctx, res.message)
+				if retryAfter, shouldRetry := r.processor.ProcessReceivedMessage(ctx, res.message); shouldRetry {
+					r.throttled = true
+					r.retryAfter = retryAfter
+					return
+				}
 			}
 		}
 	}

@@ -129,10 +129,11 @@ func (h *HTTPSender) Run(
 	packagesStateProvider types.PackagesStateProvider,
 	packageSyncMutex *sync.Mutex,
 	reporterInterval time.Duration,
+	maxRetryAfter time.Duration,
 ) {
 	h.url = url
 	h.callbacks = callbacks
-	h.receiveProcessor = newReceivedProcessor(h.logger, callbacks, h, clientSyncedState, packagesStateProvider, packageSyncMutex, reporterInterval)
+	h.receiveProcessor = newReceivedProcessor(h.logger, callbacks, h, clientSyncedState, packagesStateProvider, packageSyncMutex, reporterInterval, maxRetryAfter)
 
 	// we need to detect if the redirect was ever set, if not, we want default behaviour
 	if callbacks.CheckRedirect != nil {
@@ -142,13 +143,36 @@ func (h *HTTPSender) Run(
 		}
 	}
 
+	throttleBackoff := backoff.NewExponentialBackOff()
+	throttleBackoff.MaxElapsedTime = 0
+	throttleBackoff.InitialInterval = DefaultUnavailableRetryInterval
+
 	for {
 		pollingTimer := time.NewTimer(time.Millisecond * time.Duration(h.pollingIntervalMs.Load()))
 		select {
 		case <-h.hasPendingMessage:
 			// Have something to send. Stop the polling timer and send what we have.
 			pollingTimer.Stop()
-			h.makeOneRequestRoundtrip(ctx)
+			retryAfter, shouldRetry := h.makeOneRequestRoundtrip(ctx)
+			if shouldRetry {
+				var wait time.Duration
+				if retryAfter > 0 {
+					wait = retryAfter
+					throttleBackoff.Reset()
+				} else {
+					wait = throttleBackoff.NextBackOff()
+				}
+				h.logger.Debugf(ctx, "Server is unavailable, will retry after %v", wait)
+				timer := time.NewTimer(wait)
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				}
+			} else {
+				throttleBackoff.Reset()
+			}
 
 		case <-pollingTimer.C:
 			// Polling interval has passed. Force a status update.
@@ -190,17 +214,19 @@ func (h *HTTPSender) SetRequestHeader(baseHeaders http.Header, headerFunc func(h
 // makeOneRequestRoundtrip sends a request and receives a response.
 // It will retry the request if the server responds with too many
 // requests or unavailable status.
-func (h *HTTPSender) makeOneRequestRoundtrip(ctx context.Context) {
+// Returns retryAfter and shouldRetry when the server sends UNAVAILABLE in the
+// response body (HTTP 200 with protobuf error_response).
+func (h *HTTPSender) makeOneRequestRoundtrip(ctx context.Context) (retryAfter time.Duration, shouldRetry bool) {
 	resp, err := h.sendRequestWithRetries(ctx)
 	if err != nil {
 		h.logger.Errorf(ctx, "%v", err)
-		return
+		return 0, false
 	}
 	if resp == nil {
 		// No request was sent and nothing to receive.
-		return
+		return 0, false
 	}
-	h.receiveResponse(ctx, resp)
+	return h.receiveResponse(ctx, resp)
 }
 
 // requestResult represents the outcome of a single HTTP request attempt.
@@ -363,22 +389,22 @@ func (h *HTTPSender) prepareRequest(ctx context.Context) (*requestWrapper, error
 	return &req, nil
 }
 
-func (h *HTTPSender) receiveResponse(ctx context.Context, resp *http.Response) {
+func (h *HTTPSender) receiveResponse(ctx context.Context, resp *http.Response) (retryAfter time.Duration, shouldRetry bool) {
 	msgBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		_ = resp.Body.Close()
 		h.logger.Errorf(ctx, "cannot read response body: %v", err)
-		return
+		return 0, false
 	}
 	_ = resp.Body.Close()
 
 	var response protobufs.ServerToAgent
 	if err := proto.Unmarshal(msgBytes, &response); err != nil {
 		h.logger.Errorf(ctx, "cannot unmarshal response: %v", err)
-		return
+		return 0, false
 	}
 
-	h.receiveProcessor.ProcessReceivedMessage(ctx, &response)
+	return h.receiveProcessor.ProcessReceivedMessage(ctx, &response)
 }
 
 func (h *HTTPSender) SetHeartbeatInterval(duration time.Duration) error {

@@ -34,6 +34,9 @@ type receivedProcessor struct {
 	// Download reporter interval value
 	// a negative number indicates that the default should be used instead.
 	downloadReporterInt time.Duration
+
+	// maxRetryAfter caps server-specified retry durations. Zero means no cap.
+	maxRetryAfter time.Duration
 }
 
 func newReceivedProcessor(
@@ -44,6 +47,7 @@ func newReceivedProcessor(
 	packagesStateProvider types.PackagesStateProvider,
 	packageSyncMutex *sync.Mutex,
 	downloadReporterInt time.Duration,
+	maxRetryAfter time.Duration,
 ) receivedProcessor {
 	return receivedProcessor{
 		logger:                logger,
@@ -53,13 +57,18 @@ func newReceivedProcessor(
 		packagesStateProvider: packagesStateProvider,
 		packageSyncMutex:      packageSyncMutex,
 		downloadReporterInt:   downloadReporterInt,
+		maxRetryAfter:         maxRetryAfter,
 	}
 }
 
 // ProcessReceivedMessage is the entry point into the processing routine. It examines
 // the received message and performs any processing necessary based on what fields are set.
 // This function will call any relevant callbacks.
-func (r *receivedProcessor) ProcessReceivedMessage(ctx context.Context, msg *protobufs.ServerToAgent) {
+// When the server sends an UNAVAILABLE error response, retryAfter will be non-negative
+// and shouldRetry will be true. If the server specified retry_info, retryAfter is the
+// server-specified duration; otherwise retryAfter is 0 indicating the caller should
+// use exponential backoff.
+func (r *receivedProcessor) ProcessReceivedMessage(ctx context.Context, msg *protobufs.ServerToAgent) (retryAfter time.Duration, shouldRetry bool) {
 	// Note that anytime we add a new command capabilities we need to add a check here.
 	// This is because we want to ignore commands that the agent does not have the capability
 	// to process.
@@ -204,8 +213,9 @@ func (r *receivedProcessor) ProcessReceivedMessage(ctx context.Context, msg *pro
 
 	errResponse := msg.GetErrorResponse()
 	if errResponse != nil {
-		r.processErrorResponse(ctx, errResponse)
+		retryAfter, shouldRetry = r.processErrorResponse(ctx, errResponse)
 	}
+	return retryAfter, shouldRetry
 }
 
 func (r *receivedProcessor) hasCapability(capability protobufs.AgentCapabilities) bool {
@@ -372,10 +382,30 @@ func (r *receivedProcessor) rcvConnectionSettings(ctx context.Context, settings 
 	}
 }
 
-func (r *receivedProcessor) processErrorResponse(ctx context.Context, body *protobufs.ServerErrorResponse) {
-	if body != nil {
-		r.callbacks.OnError(ctx, body)
+// processErrorResponse handles a ServerErrorResponse. Returns the retry-after
+// duration and true if the caller should disconnect and retry (UNAVAILABLE).
+// When retry_info is present, retryAfter is the server-specified duration (optionally
+// capped by maxRetryAfter if configured). When retry_info is absent, retryAfter is 0,
+// indicating the caller should use exponential backoff per the spec.
+func (r *receivedProcessor) processErrorResponse(ctx context.Context, body *protobufs.ServerErrorResponse) (retryAfter time.Duration, shouldRetry bool) {
+	if body == nil {
+		return 0, false
 	}
+
+	r.callbacks.OnError(ctx, body)
+
+	if body.Type == protobufs.ServerErrorResponseType_ServerErrorResponseType_Unavailable {
+		if retryInfo := body.GetRetryInfo(); retryInfo != nil && retryInfo.RetryAfterNanoseconds > 0 {
+			ns := time.Duration(retryInfo.RetryAfterNanoseconds)
+			if r.maxRetryAfter > 0 && ns > r.maxRetryAfter {
+				r.logger.Debugf(ctx, "Server requested retry after %v, capping to %v", ns, r.maxRetryAfter)
+				ns = r.maxRetryAfter
+			}
+			return ns, true
+		}
+		return 0, true
+	}
+	return 0, false
 }
 
 func (r *receivedProcessor) rcvAgentIdentification(ctx context.Context, agentId *protobufs.AgentIdentification) error {

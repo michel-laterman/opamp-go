@@ -72,7 +72,8 @@ type Callbacks struct {
 	// OnError is called when the Server reports an error in response to some previously
 	// sent request. Useful for logging purposes. The Agent should not attempt to process
 	// the error by reconnecting or retrying previous operations. The client handles the
-	// ErrorResponse_UNAVAILABLE case internally by performing retries as necessary.
+	// UNAVAILABLE case internally by disconnecting and reconnecting with the appropriate
+	// retry interval (using retry_info from the server response, or exponential backoff).
 	OnError func(ctx context.Context, err *protobufs.ServerErrorResponse)
 
 	// OnMessage is called when the Agent receives a message that needs processing.

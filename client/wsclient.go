@@ -347,17 +347,24 @@ func (c *wsClient) ensureConnected(ctx context.Context) error {
 // When Stop() is called (ctx is cancelled, isStopping is set), wsClient will shutdown gracefully:
 //  1. sender will be cancelled by the ctx, send the close message to server and return the error via sender.Err().
 //  2. runOneCycle will handle that error and wait for the close message from server until timeout.
-func (c *wsClient) runOneCycle(ctx context.Context, sendFirstMessage bool) {
+//
+// runOneCycle returns an OptionalDuration indicating the server requested a retry delay
+// (Defined=true) when UNAVAILABLE was received. If retry_info was provided, Duration is
+// set to the server-specified value. If UNAVAILABLE was received without retry_info,
+// Duration is 0 and the caller should use exponential backoff.
+func (c *wsClient) runOneCycle(ctx context.Context, sendFirstMessage bool) sharedinternal.OptionalDuration {
+	noRetry := sharedinternal.OptionalDuration{Defined: false}
+
 	if err := c.ensureConnected(ctx); err != nil {
 		// Can't connect, so can't move forward. This currently happens when we
 		// are being stopped.
-		return
+		return noRetry
 	}
 	// Close the underlying connection.
 	defer c.conn.Close()
 
 	if c.common.IsStopping() {
-		return
+		return noRetry
 	}
 
 	if sendFirstMessage {
@@ -365,7 +372,7 @@ func (c *wsClient) runOneCycle(ctx context.Context, sendFirstMessage bool) {
 		err := c.common.PrepareFirstMessage(ctx)
 		if err != nil {
 			c.common.Logger.Errorf(ctx, "cannot prepare the first message:%v", err)
-			return
+			return noRetry
 		}
 	} else {
 		// Send the next message even if it is empty
@@ -381,7 +388,7 @@ func (c *wsClient) runOneCycle(ctx context.Context, sendFirstMessage bool) {
 	if err := c.sender.Start(senderCtx, c.conn); err != nil {
 		c.common.Logger.Errorf(senderCtx, "Failed to send message after connection: %v", err)
 		// We could not send the report, the only thing we can do is start over.
-		return
+		return noRetry
 	}
 
 	// First status report sent. Now loop to receive and process messages.
@@ -394,6 +401,7 @@ func (c *wsClient) runOneCycle(ctx context.Context, sendFirstMessage bool) {
 		c.common.PackagesStateProvider,
 		&c.common.PackageSyncMutex,
 		c.common.DownloadReporterInterval,
+		c.common.MaxRetryAfter,
 	)
 
 	// When the wsclient is closed, the context passed to runOneCycle will be canceled.
@@ -411,7 +419,7 @@ func (c *wsClient) runOneCycle(ctx context.Context, sendFirstMessage bool) {
 
 			stopReceiver()
 			<-r.IsStopped()
-			break
+			return noRetry
 		}
 
 		c.common.Logger.Debugf(ctx, "Waiting for receiver to stop.")
@@ -423,25 +431,64 @@ func (c *wsClient) runOneCycle(ctx context.Context, sendFirstMessage bool) {
 			stopReceiver()
 			<-r.IsStopped()
 		}
-	case <-r.IsStopped():
-		// If we exited receiverLoop it means there is a connection error, we cannot
-		// read messages anymore. We need to start over.
+		return noRetry
 
+	case <-r.IsStopped():
+		// If we exited receiverLoop it means there is a connection error or
+		// server sent UNAVAILABLE. We need to start over.
 		stopSender()
 		<-c.sender.IsStopped()
+
+		if r.Throttled() {
+			return sharedinternal.OptionalDuration{Defined: true, Duration: r.RetryAfter()}
+		}
+		return noRetry
 	}
 }
 
 func (c *wsClient) runUntilStopped(ctx context.Context) {
 	// Iterates until we detect that the client is stopping.
 	sendFirstMessage := true
+	throttleBackoff := backoff.NewExponentialBackOff()
+	throttleBackoff.MaxElapsedTime = 0
+	throttleBackoff.InitialInterval = internal.DefaultUnavailableRetryInterval
+
 	for {
 		if c.common.IsStopping() {
 			return
 		}
 
-		c.runOneCycle(ctx, sendFirstMessage)
-		sendFirstMessage = false
+		retryAfter := c.runOneCycle(ctx, sendFirstMessage)
+
+		if !retryAfter.Defined {
+			// Normal disconnect (connection error), reconnect immediately.
+			// ensureConnected has its own backoff for connection failures.
+			sendFirstMessage = false
+			throttleBackoff.Reset()
+			continue
+		}
+
+		// Server sent UNAVAILABLE. Wait before reconnecting.
+		// Send a full first message on reconnect since the server may have lost state.
+		sendFirstMessage = true
+
+		var wait time.Duration
+		if retryAfter.Duration > 0 {
+			// Server specified an exact retry duration.
+			wait = retryAfter.Duration
+			throttleBackoff.Reset()
+		} else {
+			// No retry_info — use exponential backoff per the spec.
+			wait = throttleBackoff.NextBackOff()
+		}
+
+		timer := time.NewTimer(wait)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		}
 	}
 }
 

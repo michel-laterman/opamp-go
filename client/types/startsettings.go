@@ -77,4 +77,12 @@ type StartSettings struct {
 	// If nil, the default reporter interval (10s) will be used.
 	// If specified a minimum value of 1s will be enforced.
 	DownloadReporterInterval *time.Duration
+
+	// Optional MaxRetryAfter caps the server-specified retry_after_nanoseconds
+	// duration when the server sends an UNAVAILABLE error response. This prevents
+	// a malicious or misconfigured server from effectively disabling the client
+	// by requesting an excessively long retry delay.
+	// If zero (the default), no cap is applied and the server-specified duration
+	// is used as-is.
+	MaxRetryAfter time.Duration
 }
