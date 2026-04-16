@@ -286,7 +286,9 @@ func TestRequestInstanceUidFlagReset(t *testing.T) {
 	clientSyncedState.SetFlags(protobufs.AgentToServerFlags_AgentToServerFlags_RequestInstanceUid)
 	capabilities := protobufs.AgentCapabilities_AgentCapabilities_Unspecified
 	clientSyncedState.SetCapabilities(&capabilities)
-	sender.receiveProcessor = newReceivedProcessor(&sharedinternal.NopLogger{}, sender.callbacks, sender, clientSyncedState, nil, new(sync.Mutex), time.Second, 0)
+	sender.receiveProcessor = newReceivedProcessor(sender.callbacks, sender, clientSyncedState,
+		WithDownloadReporterInterval(time.Second),
+	)
 
 	// If we process a message with a nil AgentIdentification, or an incorrect NewInstanceUid.
 	sender.receiveProcessor.ProcessReceivedMessage(ctx,
@@ -344,7 +346,11 @@ func TestPackageUpdatesInParallel(t *testing.T) {
 	clientSyncedState := &ClientSyncedState{}
 	capabilities := protobufs.AgentCapabilities_AgentCapabilities_AcceptsPackages
 	clientSyncedState.SetCapabilities(&capabilities)
-	sender.receiveProcessor = newReceivedProcessor(&sharedinternal.NopLogger{}, sender.callbacks, sender, clientSyncedState, localPackageState, &mux, time.Second, 0)
+	sender.receiveProcessor = newReceivedProcessor(sender.callbacks, sender, clientSyncedState,
+		WithPackagesStateProvider(localPackageState),
+		WithPackageSyncMutex(&mux),
+		WithDownloadReporterInterval(time.Second),
+	)
 
 	sender.receiveProcessor.ProcessReceivedMessage(ctx,
 		&protobufs.ServerToAgent{
@@ -420,7 +426,11 @@ func TestPackageUpdatesWithError(t *testing.T) {
 	capabilities := protobufs.AgentCapabilities_AgentCapabilities_AcceptsPackages
 	clientSyncedState.SetCapabilities(&capabilities)
 
-	sender.receiveProcessor = newReceivedProcessor(&sharedinternal.NopLogger{}, sender.callbacks, sender, clientSyncedState, localPackageState, &mux, time.Second, 0)
+	sender.receiveProcessor = newReceivedProcessor(sender.callbacks, sender, clientSyncedState,
+		WithPackagesStateProvider(localPackageState),
+		WithPackageSyncMutex(&mux),
+		WithDownloadReporterInterval(time.Second),
+	)
 
 	// Send two messages in parallel.
 	sender.receiveProcessor.ProcessReceivedMessage(ctx,

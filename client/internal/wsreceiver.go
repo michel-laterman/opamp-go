@@ -3,7 +3,6 @@ package internal
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -15,9 +14,6 @@ import (
 // wsReceiver implements the WebSocket client's receiving portion of OpAMP protocol.
 type wsReceiver struct {
 	conn      *websocket.Conn
-	logger    types.Logger
-	sender    *WSSender
-	callbacks types.Callbacks
 	processor receivedProcessor
 
 	// Indicates that the receiver has fully stopped.
@@ -34,22 +30,15 @@ type wsReceiver struct {
 // NewWSReceiver creates a new Receiver that uses WebSocket to receive
 // messages from the server.
 func NewWSReceiver(
-	logger types.Logger,
-	callbacks types.Callbacks,
 	conn *websocket.Conn,
 	sender *WSSender,
+	callbacks types.Callbacks,
 	clientSyncedState *ClientSyncedState,
-	packagesStateProvider types.PackagesStateProvider,
-	packageSyncMutex *sync.Mutex,
-	reporterInterval time.Duration,
-	maxRetryAfter time.Duration,
+	opts ...ProcessorOption,
 ) *wsReceiver {
 	w := &wsReceiver{
 		conn:      conn,
-		logger:    logger,
-		sender:    sender,
-		callbacks: callbacks,
-		processor: newReceivedProcessor(logger, callbacks, sender, clientSyncedState, packagesStateProvider, packageSyncMutex, reporterInterval, maxRetryAfter),
+		processor: newReceivedProcessor(callbacks, sender, clientSyncedState, opts...),
 		stopped:   make(chan struct{}),
 	}
 
@@ -109,7 +98,7 @@ func (r *wsReceiver) ReceiverLoop(ctx context.Context) {
 			case res := <-result:
 				if res.err != nil {
 					if !websocket.IsCloseError(res.err, websocket.CloseNormalClosure) {
-						r.logger.Errorf(ctx, "Unexpected error while receiving: %v", res.err)
+						r.processor.logger.Errorf(ctx, "Unexpected error while receiving: %v", res.err)
 					}
 					return
 				}

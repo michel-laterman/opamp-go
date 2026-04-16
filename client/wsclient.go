@@ -393,15 +393,15 @@ func (c *wsClient) runOneCycle(ctx context.Context, sendFirstMessage bool) share
 
 	// First status report sent. Now loop to receive and process messages.
 	r := internal.NewWSReceiver(
-		c.common.Logger,
-		c.common.Callbacks,
 		c.conn,
 		c.sender,
+		c.common.Callbacks,
 		&c.common.ClientSyncedState,
-		c.common.PackagesStateProvider,
-		&c.common.PackageSyncMutex,
-		c.common.DownloadReporterInterval,
-		c.common.MaxRetryAfter,
+		internal.WithLogger(c.common.Logger),
+		internal.WithPackagesStateProvider(c.common.PackagesStateProvider),
+		internal.WithPackageSyncMutex(&c.common.PackageSyncMutex),
+		internal.WithDownloadReporterInterval(c.common.DownloadReporterInterval),
+		internal.WithMaxRetryAfter(c.common.MaxRetryAfter),
 	)
 
 	// When the wsclient is closed, the context passed to runOneCycle will be canceled.

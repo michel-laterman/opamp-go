@@ -10,16 +10,12 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/open-telemetry/opamp-go/client/types"
-	sharedinternal "github.com/open-telemetry/opamp-go/internal"
 	"github.com/open-telemetry/opamp-go/protobufs"
 )
 
 func TestProcessErrorResponseUnavailable(t *testing.T) {
 	t.Run("returns true with retry_info", func(t *testing.T) {
-		processor := newReceivedProcessor(
-			&sharedinternal.NopLogger{}, defaultCallbacks(), NewMockSender(), &ClientSyncedState{},
-			nil, nil, -1, 0,
-		)
+		processor := newReceivedProcessor(defaultCallbacks(), NewMockSender(), &ClientSyncedState{})
 
 		body := &protobufs.ServerErrorResponse{
 			Type:         protobufs.ServerErrorResponseType_ServerErrorResponseType_Unavailable,
@@ -37,10 +33,7 @@ func TestProcessErrorResponseUnavailable(t *testing.T) {
 	})
 
 	t.Run("returns true with zero retryAfter when no retry_info", func(t *testing.T) {
-		processor := newReceivedProcessor(
-			&sharedinternal.NopLogger{}, defaultCallbacks(), NewMockSender(), &ClientSyncedState{},
-			nil, nil, -1, 0,
-		)
+		processor := newReceivedProcessor(defaultCallbacks(), NewMockSender(), &ClientSyncedState{})
 
 		body := &protobufs.ServerErrorResponse{
 			Type:         protobufs.ServerErrorResponseType_ServerErrorResponseType_Unavailable,
@@ -54,10 +47,7 @@ func TestProcessErrorResponseUnavailable(t *testing.T) {
 	})
 
 	t.Run("returns false for non-unavailable errors", func(t *testing.T) {
-		processor := newReceivedProcessor(
-			&sharedinternal.NopLogger{}, defaultCallbacks(), NewMockSender(), &ClientSyncedState{},
-			nil, nil, -1, 0,
-		)
+		processor := newReceivedProcessor(defaultCallbacks(), NewMockSender(), &ClientSyncedState{})
 
 		body := &protobufs.ServerErrorResponse{
 			Type:         protobufs.ServerErrorResponseType_ServerErrorResponseType_BadRequest,
@@ -69,10 +59,9 @@ func TestProcessErrorResponseUnavailable(t *testing.T) {
 	})
 
 	t.Run("caps retry_info when maxRetryAfter is configured", func(t *testing.T) {
-		cap := 15 * time.Minute
-		processor := newReceivedProcessor(
-			&sharedinternal.NopLogger{}, defaultCallbacks(), NewMockSender(), &ClientSyncedState{},
-			nil, nil, -1, cap,
+		maxRetry := 15 * time.Minute
+		processor := newReceivedProcessor(defaultCallbacks(), NewMockSender(), &ClientSyncedState{},
+			WithMaxRetryAfter(maxRetry),
 		)
 
 		body := &protobufs.ServerErrorResponse{
@@ -86,14 +75,11 @@ func TestProcessErrorResponseUnavailable(t *testing.T) {
 
 		retryAfter, shouldRetry := processor.processErrorResponse(t.Context(), body)
 		assert.True(t, shouldRetry)
-		assert.Equal(t, cap, retryAfter, "should be capped at configured maxRetryAfter")
+		assert.Equal(t, maxRetry, retryAfter, "should be capped at configured maxRetryAfter")
 	})
 
 	t.Run("does not cap when maxRetryAfter is zero", func(t *testing.T) {
-		processor := newReceivedProcessor(
-			&sharedinternal.NopLogger{}, defaultCallbacks(), NewMockSender(), &ClientSyncedState{},
-			nil, nil, -1, 0,
-		)
+		processor := newReceivedProcessor(defaultCallbacks(), NewMockSender(), &ClientSyncedState{})
 
 		largeDuration := 500 * time.Hour
 		body := &protobufs.ServerErrorResponse{
@@ -117,10 +103,7 @@ func TestProcessErrorResponseUnavailable(t *testing.T) {
 			gotError.Store(true)
 		}
 
-		processor := newReceivedProcessor(
-			&sharedinternal.NopLogger{}, callbacks, NewMockSender(), &ClientSyncedState{},
-			nil, nil, -1, 0,
-		)
+		processor := newReceivedProcessor(callbacks, NewMockSender(), &ClientSyncedState{})
 
 		body := &protobufs.ServerErrorResponse{
 			Type:         protobufs.ServerErrorResponseType_ServerErrorResponseType_Unavailable,
@@ -133,10 +116,7 @@ func TestProcessErrorResponseUnavailable(t *testing.T) {
 }
 
 func TestProcessReceivedMessageUnavailableRetry(t *testing.T) {
-	processor := newReceivedProcessor(
-		&sharedinternal.NopLogger{}, defaultCallbacks(), NewMockSender(), &ClientSyncedState{},
-		nil, nil, -1, 0,
-	)
+	processor := newReceivedProcessor(defaultCallbacks(), NewMockSender(), &ClientSyncedState{})
 
 	retryDuration := 10 * time.Second
 	msg := &protobufs.ServerToAgent{

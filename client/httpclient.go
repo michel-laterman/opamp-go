@@ -147,10 +147,10 @@ func (c *httpClient) runUntilStopped(ctx context.Context) {
 		c.opAMPServerURL,
 		c.common.Callbacks,
 		&c.common.ClientSyncedState,
-		c.common.PackagesStateProvider,
-		&c.common.PackageSyncMutex,
-		c.common.DownloadReporterInterval,
-		c.common.MaxRetryAfter,
+		internal.WithPackagesStateProvider(c.common.PackagesStateProvider),
+		internal.WithPackageSyncMutex(&c.common.PackageSyncMutex),
+		internal.WithDownloadReporterInterval(c.common.DownloadReporterInterval),
+		internal.WithMaxRetryAfter(c.common.MaxRetryAfter),
 	)
 }
 

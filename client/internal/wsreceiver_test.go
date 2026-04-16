@@ -93,7 +93,10 @@ func TestServerToAgentCommand(t *testing.T) {
 			sender := WSSender{}
 			capabilities := protobufs.AgentCapabilities_AgentCapabilities_AcceptsRestartCommand
 			clientSyncedState.SetCapabilities(&capabilities)
-			receiver := NewWSReceiver(TestLogger{t}, callbacks, nil, &sender, &clientSyncedState, nil, new(sync.Mutex), time.Second, 0)
+			receiver := NewWSReceiver(nil, &sender, callbacks, &clientSyncedState,
+				WithLogger(TestLogger{t}),
+				WithDownloadReporterInterval(time.Second),
+			)
 			receiver.processor.ProcessReceivedMessage(context.Background(), &protobufs.ServerToAgent{
 				Command: test.command,
 			})
@@ -148,7 +151,10 @@ func TestServerToAgentCommandExclusive(t *testing.T) {
 		}
 		clientSyncedState := ClientSyncedState{}
 		clientSyncedState.SetCapabilities(&test.capabilities)
-		receiver := NewWSReceiver(TestLogger{t}, callbacks, nil, nil, &clientSyncedState, nil, new(sync.Mutex), time.Second, 0)
+		receiver := NewWSReceiver(nil, nil, callbacks, &clientSyncedState,
+			WithLogger(TestLogger{t}),
+			WithDownloadReporterInterval(time.Second),
+		)
 		receiver.processor.ProcessReceivedMessage(context.Background(), &protobufs.ServerToAgent{
 			Command: &protobufs.ServerToAgentCommand{
 				Type: protobufs.CommandType_CommandType_Restart,
@@ -211,7 +217,10 @@ func TestReceiverLoopStop(t *testing.T) {
 	sender := WSSender{}
 	capabilities := protobufs.AgentCapabilities_AgentCapabilities_AcceptsRestartCommand
 	clientSyncedState.SetCapabilities(&capabilities)
-	receiver := NewWSReceiver(TestLogger{t}, callbacks, conn, &sender, &clientSyncedState, nil, new(sync.Mutex), time.Second, 0)
+	receiver := NewWSReceiver(conn, &sender, callbacks, &clientSyncedState,
+		WithLogger(TestLogger{t}),
+		WithDownloadReporterInterval(time.Second),
+	)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	go func() {
@@ -254,7 +263,11 @@ func TestWSPackageUpdatesInParallel(t *testing.T) {
 	capabilities := protobufs.AgentCapabilities_AgentCapabilities_AcceptsPackages
 	sender := NewSender(&internal.NopLogger{})
 	clientSyncedState.SetCapabilities(&capabilities)
-	receiver := NewWSReceiver(&internal.NopLogger{}, callbacks, nil, sender, clientSyncedState, localPackageState, &mux, time.Second, 0)
+	receiver := NewWSReceiver(nil, sender, callbacks, clientSyncedState,
+		WithPackagesStateProvider(localPackageState),
+		WithPackageSyncMutex(&mux),
+		WithDownloadReporterInterval(time.Second),
+	)
 
 	receiver.processor.ProcessReceivedMessage(ctx,
 		&protobufs.ServerToAgent{
@@ -369,7 +382,9 @@ func TestRecieveMessage(t *testing.T) {
 			state := &ClientSyncedState{}
 			capabilities := protobufs.AgentCapabilities_AgentCapabilities_ReportsStatus
 			state.SetCapabilities(&capabilities)
-			rec := NewWSReceiver(&internal.NopLogger{}, callbacks, conn, NewSender(&internal.NopLogger{}), state, nil, new(sync.Mutex), time.Second, 0)
+			rec := NewWSReceiver(conn, NewSender(&internal.NopLogger{}), callbacks, state,
+				WithDownloadReporterInterval(time.Second),
+			)
 
 			err = rec.receiveMessage(&protobufs.ServerToAgent{})
 			if tc.hasError {

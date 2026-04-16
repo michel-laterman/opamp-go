@@ -10,7 +10,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -126,14 +125,13 @@ func (h *HTTPSender) Run(
 	url string,
 	callbacks types.Callbacks,
 	clientSyncedState *ClientSyncedState,
-	packagesStateProvider types.PackagesStateProvider,
-	packageSyncMutex *sync.Mutex,
-	reporterInterval time.Duration,
-	maxRetryAfter time.Duration,
+	opts ...ProcessorOption,
 ) {
 	h.url = url
 	h.callbacks = callbacks
-	h.receiveProcessor = newReceivedProcessor(h.logger, callbacks, h, clientSyncedState, packagesStateProvider, packageSyncMutex, reporterInterval, maxRetryAfter)
+	// Prepend WithLogger so explicit options in opts override it.
+	opts = append([]ProcessorOption{WithLogger(h.logger)}, opts...)
+	h.receiveProcessor = newReceivedProcessor(callbacks, h, clientSyncedState, opts...)
 
 	// we need to detect if the redirect was ever set, if not, we want default behaviour
 	if callbacks.CheckRedirect != nil {

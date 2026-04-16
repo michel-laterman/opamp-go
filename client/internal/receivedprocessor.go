@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/open-telemetry/opamp-go/client/types"
+	sharedinternal "github.com/open-telemetry/opamp-go/internal"
 	"github.com/open-telemetry/opamp-go/protobufs"
 	"google.golang.org/protobuf/proto"
 )
@@ -31,34 +32,78 @@ type receivedProcessor struct {
 	// packageSyncMutex protects against multiple package syncing operations at the same time.
 	packageSyncMutex *sync.Mutex
 
-	// Download reporter interval value
-	// a negative number indicates that the default should be used instead.
-	downloadReporterInt time.Duration
+	// downloadReporterInterval is the interval used to update a package's status
+	// while it is downloading. A negative number indicates that the default
+	// should be used instead.
+	downloadReporterInterval time.Duration
 
-	// maxRetryAfter caps server-specified retry durations. Zero means no cap.
+	// maxRetryAfter caps server-specified retry durations for UNAVAILABLE
+	// responses. Zero means no cap.
 	maxRetryAfter time.Duration
 }
 
+// ProcessorOption configures optional dependencies and tuning parameters for
+// the receivedProcessor. Use with newReceivedProcessor, NewWSReceiver, and
+// HTTPSender.Run.
+type ProcessorOption func(*receivedProcessor)
+
+// WithLogger sets the logger used by the processor. Defaults to a no-op logger.
+func WithLogger(logger types.Logger) ProcessorOption {
+	return func(r *receivedProcessor) {
+		r.logger = logger
+	}
+}
+
+// WithPackagesStateProvider sets the PackagesStateProvider used for package syncing.
+// Defaults to nil (packages disabled).
+func WithPackagesStateProvider(p types.PackagesStateProvider) ProcessorOption {
+	return func(r *receivedProcessor) {
+		r.packagesStateProvider = p
+	}
+}
+
+// WithPackageSyncMutex sets the mutex used to serialize package-sync operations.
+// Defaults to a fresh mutex owned by the processor.
+func WithPackageSyncMutex(m *sync.Mutex) ProcessorOption {
+	return func(r *receivedProcessor) {
+		r.packageSyncMutex = m
+	}
+}
+
+// WithDownloadReporterInterval sets the interval for reporting package download
+// progress. A negative value indicates the default should be used.
+func WithDownloadReporterInterval(d time.Duration) ProcessorOption {
+	return func(r *receivedProcessor) {
+		r.downloadReporterInterval = d
+	}
+}
+
+// WithMaxRetryAfter caps server-specified retry durations for UNAVAILABLE
+// responses. Zero (the default) means no cap.
+func WithMaxRetryAfter(d time.Duration) ProcessorOption {
+	return func(r *receivedProcessor) {
+		r.maxRetryAfter = d
+	}
+}
+
 func newReceivedProcessor(
-	logger types.Logger,
 	callbacks types.Callbacks,
 	sender Sender,
 	clientSyncedState *ClientSyncedState,
-	packagesStateProvider types.PackagesStateProvider,
-	packageSyncMutex *sync.Mutex,
-	downloadReporterInt time.Duration,
-	maxRetryAfter time.Duration,
+	opts ...ProcessorOption,
 ) receivedProcessor {
-	return receivedProcessor{
-		logger:                logger,
-		callbacks:             callbacks,
-		sender:                sender,
-		clientSyncedState:     clientSyncedState,
-		packagesStateProvider: packagesStateProvider,
-		packageSyncMutex:      packageSyncMutex,
-		downloadReporterInt:   downloadReporterInt,
-		maxRetryAfter:         maxRetryAfter,
+	r := receivedProcessor{
+		logger:                   &sharedinternal.NopLogger{},
+		callbacks:                callbacks,
+		sender:                   sender,
+		clientSyncedState:        clientSyncedState,
+		packageSyncMutex:         &sync.Mutex{},
+		downloadReporterInterval: -1,
 	}
+	for _, opt := range opts {
+		opt(&r)
+	}
+	return r
 }
 
 // ProcessReceivedMessage is the entry point into the processing routine. It examines
@@ -166,7 +211,7 @@ func (r *receivedProcessor) ProcessReceivedMessage(ctx context.Context, msg *pro
 				r.clientSyncedState,
 				r.packagesStateProvider,
 				r.packageSyncMutex,
-				r.downloadReporterInt,
+				r.downloadReporterInterval,
 				r.callbacks.DownloadHTTPClient,
 			)
 			if err != nil {
